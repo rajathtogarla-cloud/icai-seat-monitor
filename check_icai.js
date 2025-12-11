@@ -1,4 +1,4 @@
-// check_icai_debug_selects.js — improved selection + diagnostic logging
+// check_icai_multi_course_force_select.js — resilient selection + multi-course checks
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
 const nodemailer = require('nodemailer');
@@ -15,8 +15,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const EMAIL_TO = process.env.EMAIL_TO;
 
   const targetURL = 'https://www.icaionlineregistration.org/launchbatchdetail.aspx';
-
-  // Courses to check — fuzzy matches allowed
   const coursesToCheck = [
     'Advanced (ICITSS) MCS Course',
     'Advanced Information Technology'
@@ -29,109 +27,137 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
-  // helper: choose an option by visible text (fuzzy) using an ElementHandle
-  async function selectOptionOnHandle(handle, text) {
+  // improved: try normal select, then fallback to forcing selection via evaluate()
+  async function trySelectOnHandle(handle, wantedText) {
     if (!handle) return false;
-    try {
-      const opts = await handle.$$eval('option', options => options.map(o => ({ value: o.value, text: o.innerText.trim() })));
-      const match = opts.find(o => o.text.toLowerCase().includes(text.toLowerCase()));
-      if (match) {
-        await handle.selectOption(match.value);
-        await handle.evaluate((el) => {
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        return true;
-      }
-    } catch (e) {
-      // ignore
+    // get options
+    const opts = await handle.$$eval('option', options => options.map(o => ({ value: o.value, text: o.innerText.trim() })));
+    // try fuzzy match (includes)
+    let match = opts.find(o => o.text.toLowerCase().includes(wantedText.toLowerCase()));
+    if (!match) {
+      // try exact trimmed match
+      match = opts.find(o => o.text.trim().toLowerCase() === wantedText.trim().toLowerCase());
     }
-    return false;
-  }
+    if (!match) return false;
 
-  // new helper: scan all selects, print their options, and try to select target by scanning
-  async function debugAndSelectFromAllSelects(targetText, label) {
-    console.log(`--- Scanning all <select> elements to find "${targetText}" (${label}) ---`);
-    const all = await page.$$('select');
-    if (all.length === 0) {
-      console.warn('No <select> elements found on the page at all.');
+    // First try the normal Playwright selectOption
+    try {
+      await handle.selectOption(match.value);
+      // dispatch events
+      await handle.evaluate((el) => {
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      console.log(`Normal selectOption succeeded for value="${match.value}" text="${match.text}"`);
+      return true;
+    } catch (e) {
+      console.warn('Normal selectOption failed, will force via evaluate():', e.message);
+    }
+
+    // Fallback: force selection via evaluate (works even if selectOption fails)
+    try {
+      await handle.evaluate((el, want) => {
+        // find matching option index by comparing trimmed text (case-insensitive)
+        let idx = -1;
+        for (let i = 0; i < el.options.length; i++) {
+          const t = (el.options[i].innerText || '').trim().toLowerCase();
+          if (t === want.trim().toLowerCase() || t.includes(want.trim().toLowerCase())) {
+            idx = i;
+            break;
+          }
+        }
+        if (idx === -1) {
+          // as a last resort, try matching by value if the want looks like a value
+          for (let i = 0; i < el.options.length; i++) {
+            if (el.options[i].value === want) { idx = i; break; }
+          }
+        }
+        if (idx !== -1) {
+          el.selectedIndex = idx;
+          el.value = el.options[idx].value;
+        }
+        // dispatch events so client JS notices
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }, match.text);
+      console.log(`Forced selection via evaluate() to option text="${match.text}", value="${match.value}"`);
+      return true;
+    } catch (e) {
+      console.error('Force-select evaluate() failed:', e.message);
       return false;
     }
-    for (let i = 0; i < all.length; ++i) {
-      const handle = all[i];
-      // get option texts (first N chars)
-      const opts = await handle.$$eval('option', options => options.map(o => o.innerText.trim()));
-      console.log(`select[#${i}] options (first 200 chars combined): ${opts.join(' | ').slice(0,200)}`);
+  }
+
+  // scan all selects, print options, and attempt to select target
+  async function scanAndSelect(wantedText, label) {
+    console.log(`--- scanAndSelect: looking for "${wantedText}" (${label}) ---`);
+    const all = await page.$$('select');
+    if (!all || all.length === 0) {
+      console.warn('No select elements found on page.');
+      return false;
     }
-    // attempt to find & select
+    // print summary of each select's option texts (first 200 chars)
     for (let i = 0; i < all.length; ++i) {
-      const handle = all[i];
-      const ok = await selectOptionOnHandle(handle, targetText);
+      const opts = await all[i].$$eval('option', options => options.map(o => (o.innerText || '').trim()));
+      console.log(`select[#${i}] options (summary): ${opts.join(' | ').slice(0,200)}`);
+    }
+    // try to pick the best select where the wanted text exists
+    for (let i = 0; i < all.length; ++i) {
+      const ok = await trySelectOnHandle(all[i], wantedText);
       if (ok) {
-        console.log(`Selected "${targetText}" using select[#${i}] (scanned).`);
+        console.log(`Selected "${wantedText}" using select[#${i}]`);
         return true;
       }
     }
-    console.warn(`Did not find option matching "${targetText}" in any <select>.`);
+    console.warn(`Could not find "${wantedText}" in any <select>.`);
     return false;
   }
 
-  // fallback: try several known selectors then scan all selects
-  async function findAndSelect(possibleSelectors, visibleText, labelForLogs='') {
-    // try direct selectors first
+  // generic find-and-select with selector hints then scan fallback
+  async function findAndSelect(possibleSelectors, wantedText, label='') {
     for (const sel of possibleSelectors) {
       try {
         const handle = await page.$(sel);
         if (!handle) continue;
-        const ok = await selectOptionOnHandle(handle, visibleText);
+        const ok = await trySelectOnHandle(handle, wantedText);
         if (ok) {
-          console.log(`Selected "${visibleText}" using selector ${sel}`);
+          console.log(`Selected "${wantedText}" using selector ${sel}`);
           return true;
         } else {
-          // log options for this selector for debugging
-          const opts = await handle.$$eval('option', options => options.map(o => o.innerText.trim()));
-          console.log(`Selector ${sel} exists but options do not match (first 200 chars): ${opts.join(' | ').slice(0,200)}`);
+          const opts = await handle.$$eval('option', options => options.map(o => (o.innerText||'').trim()));
+          console.log(`Selector ${sel} exists but options: ${opts.join(' | ').slice(0,200)}`);
         }
       } catch (e) {
         console.warn(`Selector ${sel} caused error: ${e.message}`);
       }
     }
-    // if direct selectors failed, scan all selects (and print them)
-    const scanned = await debugAndSelectFromAllSelects(visibleText, labelForLogs || visibleText);
-    return scanned;
+    // fallback: scan all selects and force select
+    return await scanAndSelect(wantedText, label || wantedText);
   }
 
   try {
     console.log('Navigating to target page...');
     await page.goto(targetURL, { waitUntil: 'networkidle', timeout: 60000 });
+    await sleep(3000);
 
-    // initial wait to let page JS populate selects
-    await sleep(3500);
-
-    // REGION & POU selectors (try a few possibilities)
     const regionSelectors = ['#ddl_reg', 'select[name*="reg"]', 'select[name*="region"]', 'select:nth-of-type(1)'];
     const pouSelectors = ['#ddl_pou', 'select[name*="pou"]', 'select:nth-of-type(2)'];
     const courseSelectors = ['#ddl_course', 'select[name*="course"]', 'select:nth-of-type(3)'];
 
-    // Try selecting Region
     const regionWanted = 'Southern';
-    const gotRegion = await findAndSelect(regionSelectors, regionWanted, 'Region');
-    if (gotRegion) {
-      await sleep(1600);
-    } else {
-      console.warn(`Failed to select "${regionWanted}". See select listings above for details.`);
-    }
-
-    // Try selecting POU
     const pouWanted = 'HYDERABAD';
+
+    const gotRegion = await findAndSelect(regionSelectors, regionWanted, 'Region');
+    if (gotRegion) await sleep(1200);
+    else console.warn(`Failed to select Region "${regionWanted}".`);
+
     const gotPou = await findAndSelect(pouSelectors, pouWanted, 'POU');
-    if (gotPou) await sleep(1500);
+    if (gotPou) await sleep(1200);
     else console.warn(`Failed to select POU "${pouWanted}".`);
 
-    if (!gotRegion || !gotPou) {
-      console.warn('Region or POU selection may have failed; script will continue but results may be incorrect.');
-    }
+    if (!gotRegion || !gotPou) console.warn('Region or POU may be incorrect; continuing anyway.');
 
-    // function to click "Get List" robustly
+    // click Get List helper
     async function clickGetList() {
       const btnXPaths = [
         `//input[@type="button" and contains(@value,"Get List")]`,
@@ -152,45 +178,35 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       return false;
     }
 
-    // collect results across courses
-    const aggregatedResults = []; // { course, batch, seats }
+    const aggregatedResults = [];
 
-    // iterate courses
     for (const courseName of coursesToCheck) {
       console.log('Checking course:', courseName);
-
-      // Select the course
       const gotCourse = await findAndSelect(courseSelectors, courseName, 'Course');
-      if (!gotCourse) {
-        console.warn(`Could not select course "${courseName}". Still attempting to click Get List and parse.`);
-      }
-      await sleep(800);
+      if (!gotCourse) console.warn(`Could not select course "${courseName}"`);
 
-      // Click Get List and wait a short while
+      await sleep(700);
       await clickGetList();
-      await sleep(2200);
+      await sleep(2000);
 
-      // locate table
+      // find table
       let tableHandle = await page.$('table');
       if (!tableHandle) tableHandle = await page.waitForSelector('table', { timeout: 6000 }).catch(()=>null);
       if (!tableHandle) {
         const html = await page.content();
-        console.error(`No table found for course "${courseName}". HTML snippet (first 20k chars):`);
+        console.error(`No table found for course "${courseName}". HTML snippet:`);
         console.error(html.slice(0,20000));
         continue;
-      } else {
-        console.log('Found table for course:', courseName);
       }
+      console.log('Found table for course:', courseName);
 
-      // find available seats column index
       const colIndex = await page.evaluate(() => {
         const tbl = document.querySelector('table');
         if (!tbl) return -1;
         const headerRow = Array.from(tbl.querySelectorAll('tr')).find(r => Array.from(r.cells).some(c => /Available\\s*Seats/i.test(c.innerText)));
         if (!headerRow) return -1;
         const cells = Array.from(headerRow.cells).map(c => c.innerText.trim());
-        const idx = cells.findIndex(c => /Available\\s*Seats/i.test(c));
-        return idx;
+        return cells.findIndex(c => /Available\\s*Seats/i.test(c));
       });
 
       const seatInfo = await page.evaluate((colIndex) => {
@@ -213,8 +229,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         return results;
       }, colIndex);
 
-      const positiveForCourse = seatInfo
-        .map(r => ({ course: courseName, batch: r.batch, seats: r.seats }))
+      const positiveForCourse = seatInfo.map(r => ({ course: courseName, batch: r.batch, seats: r.seats }))
         .filter(r => {
           const v = r.seats ? r.seats.replace(/\\D/g,'') : '';
           return v !== '' && parseInt(v,10) > 0;
@@ -222,9 +237,8 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
       console.log(`Found ${positiveForCourse.length} positive rows for "${courseName}".`);
       aggregatedResults.push(...positiveForCourse);
-
       await sleep(900);
-    } // end courses loop
+    }
 
     await browser.close();
 
@@ -242,7 +256,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       msgLines.push(`\n${targetURL}`);
       const msg = msgLines.join('\n');
 
-      // Telegram notify (with debug)
       if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
         const tgUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
         try {
