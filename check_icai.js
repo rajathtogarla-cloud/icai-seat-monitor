@@ -14,7 +14,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const SMTP_PASS = process.env.SMTP_PASS;
   const EMAIL_TO = process.env.EMAIL_TO;
 
-  const targetURL = 'https://www.icaionlineregistration.org/launchbatchdetail.aspx';
+  const targetURL = 'https://www.icaionlineregistration.org/LaunchBatchDetail.aspx';
 
   // Courses to check — fuzzy matches allowed
   const coursesToCheck = [
