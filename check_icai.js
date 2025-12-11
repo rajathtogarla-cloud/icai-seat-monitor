@@ -1,4 +1,4 @@
-// check_icai.js — checks two courses and notifies if seats > 0
+// check_icai_multi_course.js — checks two courses and notifies if seats > 0
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
 const nodemailer = require('nodemailer');
@@ -15,6 +15,12 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const EMAIL_TO = process.env.EMAIL_TO;
 
   const targetURL = 'https://www.icaionlineregistration.org/launchbatchdetail.aspx';
+
+  // Courses to check — fuzzy matches allowed
+  const coursesToCheck = [
+    'Advanced (ICITSS) MCS Course',
+    'Advanced Information Technology'
+  ];
 
   const browser = await chromium.launch({
     headless: true,
@@ -40,7 +46,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   }
 
   // helper: try multiple selector candidates for a select element
-  async function findAndSelect(possibleSelectors, visibleText, maxRetries=5) {
+  async function findAndSelect(possibleSelectors, visibleText, maxRetries=4) {
     for (let attempt=0; attempt<maxRetries; ++attempt) {
       for (const sel of possibleSelectors) {
         try {
@@ -66,150 +72,170 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
           }
         } catch (e) {}
       }
-      // wait a bit for options to populate (AJAX)
-      await sleep(1200 + attempt*500);
+      // wait a bit for options to populate (AJAX / client population)
+      await sleep(1500 + attempt*500);
     }
     console.warn(`Failed to select "${visibleText}" after ${maxRetries} attempts.`);
     return false;
   }
 
-  // clicking "Get List" helper
-  async function clickGetList() {
-    const btnXPaths = [
-      `//input[@type="button" and contains(@value,"Get List")]`,
-      `//input[@type="button" and contains(@value,"GetList")]`,
-      `//button[contains(text(),"Get List")]`,
-      `//a[contains(text(),"Get List")]`,
-      `//input[@type="submit" and contains(@value,"Get List")]`
-    ];
-    for (const xp of btnXPaths) {
-      const el = await page.$(`xpath=${xp}`);
-      if (el) { try { await el.click({ timeout: 5000 }); console.log('Clicked Get List via xpath', xp); return true; } catch(e){ console.warn('click failed', xp, e.message);} }
-    }
-    const btnFallback = await page.$('input[type="button"], button, a');
-    if (btnFallback) { await btnFallback.click().catch(()=>{}); console.log('Clicked first button fallback'); return true; }
-    console.warn('Could not find a Get List button to click.');
-    return false;
-  }
-
-  // parse table rows into [{batch, seats, rowCells...}, ...]
-  async function parseTable() {
-    // determine column index for "Available Seats"
-    const colIndex = await page.evaluate(() => {
-      const tbl = document.querySelector('table');
-      if (!tbl) return -1;
-      const headerRow = Array.from(tbl.querySelectorAll('tr')).find(r => Array.from(r.cells).some(c => /Available\s*Seats/i.test(c.innerText)));
-      if (!headerRow) return -1;
-      const cells = Array.from(headerRow.cells).map(c => c.innerText.trim());
-      const idx = cells.findIndex(c => /Available\s*Seats/i.test(c));
-      return idx;
-    });
-
-    // gather rows
-    const rows = await page.evaluate((colIndex) => {
-      const tbl = document.querySelector('table');
-      if (!tbl) return [];
-      const dataRows = Array.from(tbl.querySelectorAll('tr')).slice(1); // skip header-ish row
-      const res = dataRows.map(row => {
-        const cells = Array.from(row.cells).map(c => c.innerText.trim());
-        let batch = cells[0] || '';
-        let seats = null;
-        if (colIndex >= 0 && cells[colIndex]) seats = cells[colIndex];
-        if ((seats === null || seats === '') && cells.length > 0) {
-          for (const c of cells) {
-            if (/^\d+$/.test(c)) { seats = c; break; }
-          }
-        }
-        return { batch, seats, raw: cells };
-      });
-      return res;
-    }, colIndex);
-
-    return rows;
-  }
-
   try {
     console.log('Navigating to target page...');
     await page.goto(targetURL, { waitUntil: 'networkidle', timeout: 60000 });
-    await sleep(2500);
 
-    // selectors for region/pou/course
+    // initial wait to let page JS populate selects
+    await sleep(3000);
+
+    // REGION & POU selectors (try a few possibilities)
     const regionSelectors = ['#ddl_reg', 'select[name*="region"]', 'select:nth-of-type(1)'];
     const pouSelectors = ['#ddl_pou', 'select[name*="pou"]', 'select:nth-of-type(2)'];
     const courseSelectors = ['#ddl_course', 'select[name*="course"]', 'select:nth-of-type(3)'];
 
-    // courses to check (fuzzy match allowed)
-    const coursesToCheck = [
-      'Advanced (ICITSS) MCS Course',
-      'AICITSS-Advanced Information Technology'
-    ];
+    // Select Region once
+    const gotRegion = await findAndSelect(regionSelectors, 'Southern');
+    if (gotRegion) await sleep(1500);
 
-    const allPositives = []; // { courseName, batch, seats }
+    // Select POU once
+    const gotPou = await findAndSelect(pouSelectors, 'HYDERABAD');
+    if (gotPou) await sleep(1500);
 
-    // Pre-select region and POU each loop (safer)
+    if (!gotRegion || !gotPou) {
+      console.warn('Region or POU selection may have failed; script will continue but results may be incorrect.');
+    }
+
+    // function to click "Get List" robustly
+    async function clickGetList() {
+      const btnXPaths = [
+        `//input[@type="button" and contains(@value,"Get List")]`,
+        `//input[@type="button" and contains(@value,"GetList")]`,
+        `//button[contains(text(),"Get List")]`,
+        `//a[contains(text(),"Get List")]`,
+        `//input[@type="submit" and contains(@value,"Get List")]`
+      ];
+      for (const xp of btnXPaths) {
+        const el = await page.$(`xpath=${xp}`);
+        if (el) {
+          try { await el.click({ timeout: 5000 }); console.log('Clicked Get List via xpath', xp); return true; } catch(e){ console.warn('click failed', xp, e.message); }
+        }
+      }
+      const btnFallback = await page.$('input[type="button"], button, a');
+      if (btnFallback) { try { await btnFallback.click(); console.log('Clicked first button fallback'); return true; } catch(e) { console.warn('fallback click failed', e.message); } }
+      console.warn('Could not find a Get List button to click.');
+      return false;
+    }
+
+    // collect results across courses
+    const aggregatedResults = []; // { course, batch, seats }
+
+    // iterate courses
     for (const courseName of coursesToCheck) {
-      console.log('--- Checking course:', courseName);
-      // select Region
-      const gotRegion = await findAndSelect(regionSelectors, 'Southern');
-      if (gotRegion) await sleep(1000);
+      console.log('Checking course:', courseName);
 
-      // select POU
-      const gotPou = await findAndSelect(pouSelectors, 'HYDERABAD');
-      if (gotPou) await sleep(1000);
-
-      // select Course
+      // Select the course
       const gotCourse = await findAndSelect(courseSelectors, courseName);
       if (!gotCourse) {
-        console.warn(`Could not explicitly select course matching "${courseName}". Will still attempt to Get List.`);
+        console.warn(`Could not select course "${courseName}". Still attempting to click Get List and parse.`);
       }
-      await sleep(800);
 
-      // click Get List
+      // Click Get List and wait a short while
       await clickGetList();
-      await sleep(2200);
+      await sleep(2500);
 
-      // ensure table present
-      const tableHandle = await page.$('table');
+      // locate table (similar logic as before)
+      const possibleTableSelectors = [
+        'table', 
+        '#ctl00_ContentPlaceHolder1_gvBatch',
+        'table[class*="grid"]',
+        'div.results table',
+        '#gvBatch'
+      ];
+      let tableHandle = null;
+      for (const sel of possibleTableSelectors) {
+        try {
+          tableHandle = await page.$(sel);
+          if (tableHandle) { console.log('Found table using selector:', sel); break; }
+        } catch (e){}
+      }
       if (!tableHandle) {
-        // dump small snippet for debugging then continue to next course
+        // wait briefly for any table to appear
+        tableHandle = await page.waitForSelector('table', { timeout: 5000 }).catch(()=>null);
+        if (tableHandle) console.log('Found table by waiting for generic table selector.');
+      }
+
+      if (!tableHandle) {
+        // Dump short HTML snippet for debugging and continue to next course
         const html = await page.content();
-        console.error(`No table found after clicking Get List for course "${courseName}". Page snippet:`);
-        console.error(html.slice(0,8000));
+        const snippet = html.slice(0, 20000);
+        console.error(`No table found for course "${courseName}". Page HTML snippet (first 20k chars):`);
+        console.error(snippet);
         continue;
       }
 
-      // parse rows
-      const rows = await parseTable();
+      // find available seats column index
+      const colIndex = await page.evaluate(() => {
+        const tbl = document.querySelector('table');
+        if (!tbl) return -1;
+        const headerRow = Array.from(tbl.querySelectorAll('tr')).find(r => Array.from(r.cells).some(c => /Available\\s*Seats/i.test(c.innerText)));
+        if (!headerRow) return -1;
+        const cells = Array.from(headerRow.cells).map(c => c.innerText.trim());
+        const idx = cells.findIndex(c => /Available\\s*Seats/i.test(c));
+        return idx;
+      });
 
-      // find positives
-      for (const r of rows) {
-        const val = r.seats ? r.seats.replace(/\D/g,'') : '';
-        if (val !== '' && parseInt(val,10) > 0) {
-          allPositives.push({ course: courseName, batch: r.batch, seats: r.seats, raw: r.raw });
-        }
-      }
+      // parse rows for this course
+      const seatInfo = await page.evaluate((colIndex) => {
+        const tbl = document.querySelector('table');
+        if (!tbl) return [];
+        const rows = Array.from(tbl.querySelectorAll('tr')).slice(1);
+        const results = [];
+        rows.forEach(row => {
+          const cells = Array.from(row.cells).map(c => c.innerText.trim());
+          let batch = cells[0] || '';
+          let seats = null;
+          if (colIndex >= 0 && cells[colIndex]) seats = cells[colIndex];
+          if ((seats === null || seats === '') && cells.length > 0) {
+            for (const c of cells) {
+              if (/^\\d+$/.test(c)) { seats = c; break; }
+            }
+          }
+          results.push({ batch, seats });
+        });
+        return results;
+      }, colIndex);
 
-      // small pause before next course to allow UI to stabilise
-      await sleep(800);
-    }
+      // filter positive seats and attach course name
+      const positiveForCourse = seatInfo
+        .map(r => ({ course: courseName, batch: r.batch, seats: r.seats }))
+        .filter(r => {
+          const v = r.seats ? r.seats.replace(/\\D/g,'') : '';
+          return v !== '' && parseInt(v,10) > 0;
+        });
+
+      console.log(`Found ${positiveForCourse.length} positive rows for "${courseName}".`);
+      aggregatedResults.push(...positiveForCourse);
+
+      // small delay before next course iteration
+      await sleep(1000);
+    } // end courses loop
 
     await browser.close();
 
-    if (allPositives.length > 0) {
-      // Compose message grouped by course
-      const grouped = {};
-      for (const p of allPositives) {
-        grouped[p.course] = grouped[p.course] || [];
-        grouped[p.course].push(`${p.batch} → ${p.seats}`);
+    if (aggregatedResults.length > 0) {
+      // build message grouped by course
+      const grouped = aggregatedResults.reduce((acc, cur) => {
+        acc[cur.course] = acc[cur.course] || [];
+        acc[cur.course].push(`${cur.batch} → ${cur.seats}`);
+        return acc;
+      }, {});
+      let msgLines = ['ICAI seats available!'];
+      for (const [course, rows] of Object.entries(grouped)) {
+        msgLines.push(`\n${course}:`);
+        rows.forEach(r => msgLines.push(` - ${r}`));
       }
-      let msgParts = [`ICAI seats available!`];
-      for (const [course, items] of Object.entries(grouped)) {
-        msgParts.push(`\n${course}:\n${items.join('\n')}`);
-      }
-      msgParts.push(`\n${targetURL}`);
-      const msg = msgParts.join('\n');
+      msgLines.push(`\n${targetURL}`);
+      const msg = msgLines.join('\n');
 
-      // Telegram notify with debug logging
+      // Telegram notify (with debug)
       if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
         const tgUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
         try {
@@ -218,14 +244,14 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
             headers: {'content-type':'application/json'},
             body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: msg })
           });
-          const text = await res.text();
+          const body = await res.text();
           console.log('Telegram HTTP status:', res.status);
-          console.log('Telegram response body:', text);
+          console.log('Telegram response body:', body);
         } catch (e) {
           console.error('Telegram request failed:', e);
         }
       } else {
-        console.warn('Telegram token or chat id missing — not sending Telegram message.');
+        console.warn('Telegram env vars missing; not sending Telegram message.');
       }
 
       // Email notify via SMTP if provided
@@ -240,14 +266,14 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
           await transporter.sendMail({ from: SMTP_USER, to: EMAIL_TO, subject: 'ICAI seats available!', text: msg });
           console.log('Email sent to', EMAIL_TO);
         } catch (e) {
-          console.error('Email send failed:', e);
+          console.error('Email sending failed:', e);
         }
       }
 
-      console.log('ALERT: seats available!', allPositives);
+      console.log('ALERT: seats available!', aggregatedResults);
       process.exit(0);
     } else {
-      console.log('No seats currently available for checked courses.');
+      console.log('No seats currently available for either course.');
       process.exit(0);
     }
 
