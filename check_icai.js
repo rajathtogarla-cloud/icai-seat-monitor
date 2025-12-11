@@ -246,7 +246,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
           });
           const body = await res.text();
           console.log('Telegram HTTP status:', res.status);
-          console.log('Telegram response body:', body);
+          // console.log('Telegram response body:', body);
         } catch (e) {
           console.error('Telegram request failed:', e);
         }
