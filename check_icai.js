@@ -92,7 +92,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
     const gotPou = await findAndSelect(pouSelectors, 'HYDERABAD');
     if (gotPou) await sleep(1500);
 
-    const gotCourse = await findAndSelect(courseSelectors, 'Advanced (ICITSS) MCS');
+    const gotCourse = await findAndSelect(courseSelectors, 'Advanced (ICITSS) MCS Course');
     if (!gotRegion || !gotPou || !gotCourse) {
       console.warn('One or more selections not confirmed; continuing to try clicking Get List anyway.');
     }
