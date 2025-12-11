@@ -96,7 +96,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
     if (gotRegion) await sleep(1500);
 
     // Select POU once
-    const gotPou = await findAndSelect(pouSelectors, 'BENGALURU');
+    const gotPou = await findAndSelect(pouSelectors, 'HYDERABAD');
     if (gotPou) await sleep(1500);
 
     if (!gotRegion || !gotPou) {
