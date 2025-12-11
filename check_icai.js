@@ -28,7 +28,7 @@ const nodemailer = require('nodemailer');
     await page.goto(targetURL, { waitUntil: 'networkidle' , timeout: 60000 });
 
     // Wait for selects to appear (page uses javascript)
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(7000);
 
     // Helper to select an option by visible text for a <select> element
     async function selectByLabel(selectLocator, visibleText) {
