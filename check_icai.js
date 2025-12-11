@@ -1,4 +1,4 @@
-// check_icai_all_seats.js
+// check_icai_hyderabad_only.js
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
 const nodemailer = require('nodemailer');
@@ -23,26 +23,19 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   ];
   // ---------------------
 
-  // Helper: Send Notification (Telegram + Email)
+  // Helper: Send Notification
   async function notify(subject, message) {
     console.log(`\n--- SENDING NOTIFICATION: ${subject} ---`);
-    
-    // 1. Telegram
     if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
-      const tgUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
       try {
-        await fetch(tgUrl, {
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: `${subject}\n\n${message}` })
         });
         console.log('Telegram sent.');
-      } catch (e) {
-        console.error('Telegram failed:', e.message);
-      }
+      } catch (e) { console.error('Telegram error:', e.message); }
     }
-
-    // 2. Email
     if (SMTP_HOST && SMTP_USER && EMAIL_TO) {
       try {
         const transporter = nodemailer.createTransport({
@@ -51,16 +44,9 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
           secure: Number(SMTP_PORT) === 465,
           auth: { user: SMTP_USER, pass: SMTP_PASS }
         });
-        await transporter.sendMail({
-          from: SMTP_USER,
-          to: EMAIL_TO,
-          subject: subject,
-          text: message
-        });
+        await transporter.sendMail({ from: SMTP_USER, to: EMAIL_TO, subject, text: message });
         console.log('Email sent.');
-      } catch (e) {
-        console.error('Email failed:', e.message);
-      }
+      } catch (e) { console.error('Email error:', e.message); }
     }
   }
 
@@ -72,7 +58,6 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
-  // Helper: Select option by text (fuzzy match)
   async function findAndSelect(selectors, visibleText) {
     for (const sel of selectors) {
       try {
@@ -80,37 +65,22 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
         if (!handle) continue;
         const opts = await handle.$$eval('option', options => options.map(o => ({ value: o.value, text: o.innerText.trim() })));
         const match = opts.find(o => o.text.toLowerCase().includes(visibleText.toLowerCase()));
-        
         if (match) {
           await handle.selectOption(match.value);
           await handle.evaluate(el => el.dispatchEvent(new Event('change', { bubbles: true })));
           return true;
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {}
     }
     return false;
   }
 
-  // Helper: Click "Get List"
   async function clickGetList() {
-    const btnSelectors = [
-      'input[value*="Get List"]', 'input[value*="GetList"]', 
-      'button', 'input[type="submit"]'
-    ];
-    for (const s of btnSelectors) {
-      const el = await page.$(s);
-      if (el) {
-        try { 
-            const val = await el.getAttribute('value');
-            const txt = await el.innerText();
-            if((val && val.includes('Get')) || (txt && txt.includes('Get'))) {
-                await el.click({ timeout: 5000 }); 
-                return true; 
-            }
-        } catch (e) {}
-      }
-    }
-    try { await page.click('input[type="button"]'); return true; } catch(e) { return false; }
+    try {
+      const btn = await page.$('input[value*="Get List"], button, input[type="submit"]');
+      if (btn) { await btn.click({ timeout: 5000 }); return true; }
+    } catch(e) {}
+    return false;
   }
 
   try {
@@ -118,59 +88,66 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
     await page.goto(targetURL, { waitUntil: 'networkidle', timeout: 60000 });
     await sleep(3000);
 
-    // 1. Select Region & POU (Done once)
-    await findAndSelect(['#ddl_reg', 'select[name*="region"]'], 'Southern');
+    // 1. Select Region (Southern)
+    const regionOk = await findAndSelect(['#ddl_reg', 'select[name*="region"]'], 'Southern');
+    if (!regionOk) throw new Error("Could not select Region: Southern");
     await sleep(1500);
     
-    await findAndSelect(['#ddl_pou', 'select[name*="pou"]'], 'HYDERABAD');
+    // 2. Select POU (HYDERABAD) - STRICT CHECK
+    const pouOk = await findAndSelect(['#ddl_pou', 'select[name*="pou"]'], 'HYDERABAD');
+    if (!pouOk) {
+        throw new Error("CRITICAL: Could not select POU 'HYDERABAD'. Aborting to avoid wrong data.");
+    }
     await sleep(1500);
 
-    // 2. Iterate Courses
+    // 3. Iterate Courses
     for (const courseName of coursesToCheck) {
-      console.log(`\nChecking: ${courseName}`);
+      console.log(`\nChecking Course: ${courseName}`);
 
-      // Select Course
       const courseOk = await findAndSelect(['#ddl_course', 'select[name*="course"]'], courseName);
-      if (!courseOk) console.warn(`Could not select ${courseName}`);
+      if (!courseOk) {
+        console.warn(`Could not select course: ${courseName}`);
+        continue;
+      }
 
-      // Click Get List
       await clickGetList();
       await sleep(2500);
 
-      // Scrape Table (Get ALL rows, regardless of seat count)
-      const batchData = await page.evaluate(() => {
+      // Scrape Table
+      const rawBatches = await page.evaluate(() => {
         const tbl = document.querySelector('table[class*="grid"]') || document.querySelector('table');
         if (!tbl) return [];
         
-        // Find column index for "Available Seats"
         const headerRow = Array.from(tbl.rows).find(r => r.innerText.match(/Available\s*Seats/i));
         if (!headerRow) return [];
         const colIdx = Array.from(headerRow.cells).findIndex(c => c.innerText.match(/Available\s*Seats/i));
         
-        // Parse rows
         return Array.from(tbl.rows).slice(1).map(row => {
           const cells = Array.from(row.cells).map(c => c.innerText.trim());
           const seatsStr = (colIdx > -1 && cells[colIdx]) ? cells[colIdx] : '0';
-          // Keep raw seat string or default to "0"
-          return { batch: cells[0], seats: seatsStr };
+          return { batch: cells[0] || 'Unknown', seats: seatsStr };
         });
       });
 
-      // --- IMMEDIATE NOTIFICATION ---
-      // We send a message regardless of whether seats are > 0 or not.
-      if (batchData.length > 0) {
-        const lines = batchData.map(r => `• ${r.batch} -> ${r.seats} seats`);
-        const msg = `Status for ${courseName}:\n\n${lines.join('\n')}\n\n${targetURL}`;
-        await notify(`ICAI Status: ${courseName}`, msg);
+      // FILTER: Only keep batches containing "HYDERABAD"
+      const hydBatches = rawBatches.filter(b => b.batch.toUpperCase().includes('HYDERABAD'));
+
+      if (hydBatches.length > 0) {
+        // Create message list
+        const lines = hydBatches.map(r => `• ${r.batch} -> ${r.seats} seats`);
+        const msg = `Hyderabad Batches for ${courseName}:\n\n${lines.join('\n')}\n\n${targetURL}`;
+        await notify(`Hyderabad Status: ${courseName}`, msg);
       } else {
-        await notify(`ICAI Status: ${courseName}`, `No batches found in the table.`);
+        console.log(`No Hyderabad batches found for ${courseName}.`);
+        // Optional: Notify even if list is empty? Uncomment below if you want "No batches" alerts.
+        // await notify(`Hyderabad Status: ${courseName}`, "No batches found.");
       }
 
       await sleep(1000);
     }
 
   } catch (err) {
-    console.error('Fatal Error:', err);
+    console.error('Script Error:', err.message);
   } finally {
     await browser.close();
     process.exit(0);
