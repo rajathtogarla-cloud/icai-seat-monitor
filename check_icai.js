@@ -1,4 +1,4 @@
-// check_icai.js — Final Resilient Dual-Course Version
+// check_icai.js — Final Resilient Dual-Course Version (Crash Fix)
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
 const nodemailer = require('nodemailer');
@@ -36,17 +36,15 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
-  // --- HELPER: Select Option by Text ---
+  // --- HELPER: Select Option by Text (SAFE VERSION) ---
   async function selectOptionByText(selectHandle, text) {
     if (!selectHandle) return false;
     const opts = await selectHandle.$$eval('option', options => options.map(o => ({ value: o.value, text: o.innerText.trim() })));
     const match = opts.find(o => o.text.toLowerCase().includes(text.toLowerCase()));
     if (match) {
+      // Just select the option. Playwright handles the events.
+      // Removing the manual 'dispatchEvent' because it causes crashes on auto-reloading pages.
       await selectHandle.selectOption(match.value);
-      // Dispatch change event to trigger ASP.NET postbacks
-      await selectHandle.evaluate((el) => {
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      });
       return true;
     }
     return false;
@@ -76,32 +74,31 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
     // --- PHASE 1: ROBUST REGION & POU SELECTION ---
     console.log(`Attempting to select Region: ${REGION_TEXT}...`);
     
-    // 1. Select Region directly by ID (Most reliable)
+    // 1. Select Region
     const regionHandle = await page.$('#ddl_reg');
     if (!regionHandle) throw new Error('Could not find Region dropdown (#ddl_reg)');
     
     const regionSelected = await selectOptionByText(regionHandle, REGION_TEXT);
     if (!regionSelected) throw new Error(`Failed to select Region: ${REGION_TEXT}`);
     
-    // 2. WAIT for POU dropdown to react (Crucial Step!)
-    // We wait for the POU dropdown to be enabled/interactable, indicating the server loaded the list.
+    // CRITICAL FIX: Wait for the page reload (postback) that happens after selecting Region
+    console.log('Region selected. Waiting for page reload...');
     try {
-      await page.waitForFunction(() => {
-          const el = document.querySelector('#ddl_pou');
-          return el && !el.disabled; 
-      }, { timeout: 10000 });
+        await page.waitForLoadState('networkidle', { timeout: 10000 });
     } catch(e) {
-      console.warn('Warning: Timeout waiting for POU enable state. Continuing anyway...');
+        console.log('Page reload wait timed out (might have been quick). Continuing...');
     }
-    await sleep(2000); // Safety buffer
+    await sleep(2000); // Extra safety buffer
 
-    // 3. Select POU
+    // 2. Select POU
     console.log(`Attempting to select POU: ${POU_TEXT}...`);
+    // Re-fetch the element because the page reloaded! The old handle is dead.
     const pouHandle = await page.$('#ddl_pou');
+    if (!pouHandle) throw new Error('POU dropdown missing after region selection');
+
     const pouSelected = await selectOptionByText(pouHandle, POU_TEXT);
     
     if (!pouSelected) {
-      // Retry logic for POU
       console.warn(`First POU selection failed. Retrying...`);
       await sleep(2000);
       const retryPou = await selectOptionByText(pouHandle, POU_TEXT);
@@ -117,7 +114,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       console.log(`\n--- Checking Course: ${courseName} ---`);
 
       // A. Select Course
-      // We rely on findAndSelect here as the ID might vary slightly, but usually #ddl_course
       const gotCourse = await findAndSelect(courseSelectors, courseName);
       if (!gotCourse) {
         console.warn(`Skipping ${courseName}: Could not select option in dropdown.`);
@@ -125,7 +121,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       }
       await sleep(1500);
 
-      // B. Setup Response Listener (to catch server time)
+      // B. Setup Response Listener
       const responsePromise = page.waitForResponse(resp => 
         resp.url().toLowerCase().includes('launchbatchdetail.aspx') && resp.status() === 200
       ).catch(() => null);
@@ -150,7 +146,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       }
       
       if (!clicked) {
-        // Fallback: click any button that looks like a submit
         const fallback = await page.$('input[type="submit"], button');
         if (fallback) { await fallback.click(); clicked = true; }
       }
@@ -166,7 +161,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       // E. Find Table
       let tableHandle = await page.$('table');
       if (!tableHandle) {
-        // Wait up to 5s if table isn't there yet
         tableHandle = await page.waitForSelector('table', { timeout: 5000 }).catch(()=>null);
       }
 
@@ -180,7 +174,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         const tbl = document.querySelector('table');
         if (!tbl) return [];
         
-        // Find header index
         const headerRow = Array.from(tbl.querySelectorAll('tr')).find(r => Array.from(r.cells).some(c => /Available\s*Seats/i.test(c.innerText)));
         if (!headerRow) return [];
         
@@ -188,12 +181,10 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         const colIndex = headers.findIndex(c => /Available\s*Seats/i.test(c));
         if (colIndex === -1) return [];
 
-        // Parse rows
         const dataRows = Array.from(tbl.querySelectorAll('tr')).slice(1);
         return dataRows.map(row => {
           const cells = Array.from(row.cells).map(c => c.innerText.trim());
           let seats = cells[colIndex];
-          // If empty, try to find first numeric cell as fallback
           if (!seats || seats === '') {
              seats = cells.find(c => /^\d+$/.test(c)) || '0';
           }
@@ -214,7 +205,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         console.log(`No available seats found for ${courseName}.`);
       }
       
-      // Short pause before next loop
       await sleep(1000);
     } // End Loop
 
@@ -227,7 +217,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       const details = allFoundSeats.map(p => `• ${p.course}\n   Batch: ${p.batch} -> ${p.seats} Seats`).join('\n\n');
       const msg = `${header}\n${timeMsg}\n\n${details}\n\nLink: ${targetURL}`;
 
-      // Telegram
       if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
         const tgUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
         await fetch(tgUrl, {
@@ -237,7 +226,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         });
       }
 
-      // Email
       if (SMTP_HOST && EMAIL_TO) {
         const transporter = nodemailer.createTransport({
           host: SMTP_HOST,
