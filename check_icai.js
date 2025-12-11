@@ -1,4 +1,4 @@
-// check_icai.js — Final Resilient Dual-Course Version (Crash Fix)
+// check_icai.js — Final Resilient Version (Fixes "POU missing" error)
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
 const nodemailer = require('nodemailer');
@@ -23,7 +23,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const POU_TEXT = 'HYDERABAD';
   const COURSES_TO_CHECK = [
     'Advanced (ICITSS) MCS',
-    'AICITSS-Advanced Information Technology'
+    'Advanced Information Technology'
   ];
 
   let allFoundSeats = []; // Store results: { course, batch, seats }
@@ -42,8 +42,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
     const opts = await selectHandle.$$eval('option', options => options.map(o => ({ value: o.value, text: o.innerText.trim() })));
     const match = opts.find(o => o.text.toLowerCase().includes(text.toLowerCase()));
     if (match) {
-      // Just select the option. Playwright handles the events.
-      // Removing the manual 'dispatchEvent' because it causes crashes on auto-reloading pages.
       await selectHandle.selectOption(match.value);
       return true;
     }
@@ -75,29 +73,26 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
     console.log(`Attempting to select Region: ${REGION_TEXT}...`);
     
     // 1. Select Region
-    const regionHandle = await page.$('#ddl_reg');
-    if (!regionHandle) throw new Error('Could not find Region dropdown (#ddl_reg)');
-    
+    const regionHandle = await page.waitForSelector('#ddl_reg', { state: 'visible', timeout: 10000 });
     const regionSelected = await selectOptionByText(regionHandle, REGION_TEXT);
     if (!regionSelected) throw new Error(`Failed to select Region: ${REGION_TEXT}`);
     
-    // CRITICAL FIX: Wait for the page reload (postback) that happens after selecting Region
+    // 2. WAIT FOR PAGE RELOAD
     console.log('Region selected. Waiting for page reload...');
     try {
         await page.waitForLoadState('networkidle', { timeout: 10000 });
     } catch(e) {
-        console.log('Page reload wait timed out (might have been quick). Continuing...');
+        console.log('Reload wait timed out (page might be ready). Continuing...');
     }
-    await sleep(2000); // Extra safety buffer
+    await sleep(2000); 
 
-    // 2. Select POU
+    // 3. Select POU (The Fix: Explicitly WAIT for it to reappear)
     console.log(`Attempting to select POU: ${POU_TEXT}...`);
-    // Re-fetch the element because the page reloaded! The old handle is dead.
-    const pouHandle = await page.$('#ddl_pou');
-    if (!pouHandle) throw new Error('POU dropdown missing after region selection');
-
-    const pouSelected = await selectOptionByText(pouHandle, POU_TEXT);
     
+    // FIX: Use waitForSelector instead of $ to handle delay in element appearance
+    const pouHandle = await page.waitForSelector('#ddl_pou', { state: 'visible', timeout: 20000 });
+    
+    const pouSelected = await selectOptionByText(pouHandle, POU_TEXT);
     if (!pouSelected) {
       console.warn(`First POU selection failed. Retrying...`);
       await sleep(2000);
@@ -113,7 +108,11 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
     for (const courseName of COURSES_TO_CHECK) {
       console.log(`\n--- Checking Course: ${courseName} ---`);
 
-      // A. Select Course
+      // A. Select Course (Wait for it to be visible first)
+      try {
+        await page.waitForSelector('#ddl_course', { state: 'visible', timeout: 10000 });
+      } catch(e) {}
+
       const gotCourse = await findAndSelect(courseSelectors, courseName);
       if (!gotCourse) {
         console.warn(`Skipping ${courseName}: Could not select option in dropdown.`);
@@ -169,7 +168,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         continue;
       }
 
-      // F. Parse Table for "Available Seats"
+      // F. Parse Table
       const seatResults = await page.evaluate(() => {
         const tbl = document.querySelector('table');
         if (!tbl) return [];
