@@ -1,4 +1,4 @@
-// check_icai_multi_course.js — checks two courses and notifies if seats > 0
+// check_icai_debug_selects.js — improved selection + diagnostic logging
 const { chromium } = require('playwright');
 const fetch = require('node-fetch');
 const nodemailer = require('nodemailer');
@@ -14,7 +14,7 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const SMTP_PASS = process.env.SMTP_PASS;
   const EMAIL_TO = process.env.EMAIL_TO;
 
-  const targetURL = 'https://www.icaionlineregistration.org/LaunchBatchDetail.aspx';
+  const targetURL = 'https://www.icaionlineregistration.org/launchbatchdetail.aspx';
 
   // Courses to check — fuzzy matches allowed
   const coursesToCheck = [
@@ -29,54 +29,75 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
-  // helper: choose an option by visible text (fuzzy)
-  async function selectOptionByText(selectHandle, text) {
-    if (!selectHandle) return false;
-    const opts = await selectHandle.$$eval('option', options => options.map(o => ({ value: o.value, text: o.innerText.trim() })));
-    const match = opts.find(o => o.text.toLowerCase().includes(text.toLowerCase()));
-    if (match) {
-      await selectHandle.selectOption(match.value);
-      // dispatch change event (some pages react only to DOM events)
-      await selectHandle.evaluate((el) => {
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      return true;
+  // helper: choose an option by visible text (fuzzy) using an ElementHandle
+  async function selectOptionOnHandle(handle, text) {
+    if (!handle) return false;
+    try {
+      const opts = await handle.$$eval('option', options => options.map(o => ({ value: o.value, text: o.innerText.trim() })));
+      const match = opts.find(o => o.text.toLowerCase().includes(text.toLowerCase()));
+      if (match) {
+        await handle.selectOption(match.value);
+        await handle.evaluate((el) => {
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        return true;
+      }
+    } catch (e) {
+      // ignore
     }
     return false;
   }
 
-  // helper: try multiple selector candidates for a select element
-  async function findAndSelect(possibleSelectors, visibleText, maxRetries=4) {
-    for (let attempt=0; attempt<maxRetries; ++attempt) {
-      for (const sel of possibleSelectors) {
-        try {
-          const handle = await page.$(sel);
-          if (!handle) continue;
-          const ok = await selectOptionByText(handle, visibleText);
-          if (ok) {
-            console.log(`Selected "${visibleText}" using selector ${sel} (attempt ${attempt+1})`);
-            return true;
-          }
-        } catch (e) {
-          // continue
-        }
-      }
-      // fallback: try scanning all SELECTs
-      const allSelects = await page.$$('select');
-      for (const h of allSelects) {
-        try {
-          const ok = await selectOptionByText(h, visibleText);
-          if (ok) {
-            console.log(`Selected "${visibleText}" using one of all <select> elements (attempt ${attempt+1})`);
-            return true;
-          }
-        } catch (e) {}
-      }
-      // wait a bit for options to populate (AJAX / client population)
-      await sleep(1500 + attempt*500);
+  // new helper: scan all selects, print their options, and try to select target by scanning
+  async function debugAndSelectFromAllSelects(targetText, label) {
+    console.log(`--- Scanning all <select> elements to find "${targetText}" (${label}) ---`);
+    const all = await page.$$('select');
+    if (all.length === 0) {
+      console.warn('No <select> elements found on the page at all.');
+      return false;
     }
-    console.warn(`Failed to select "${visibleText}" after ${maxRetries} attempts.`);
+    for (let i = 0; i < all.length; ++i) {
+      const handle = all[i];
+      // get option texts (first N chars)
+      const opts = await handle.$$eval('option', options => options.map(o => o.innerText.trim()));
+      console.log(`select[#${i}] options (first 200 chars combined): ${opts.join(' | ').slice(0,200)}`);
+    }
+    // attempt to find & select
+    for (let i = 0; i < all.length; ++i) {
+      const handle = all[i];
+      const ok = await selectOptionOnHandle(handle, targetText);
+      if (ok) {
+        console.log(`Selected "${targetText}" using select[#${i}] (scanned).`);
+        return true;
+      }
+    }
+    console.warn(`Did not find option matching "${targetText}" in any <select>.`);
     return false;
+  }
+
+  // fallback: try several known selectors then scan all selects
+  async function findAndSelect(possibleSelectors, visibleText, labelForLogs='') {
+    // try direct selectors first
+    for (const sel of possibleSelectors) {
+      try {
+        const handle = await page.$(sel);
+        if (!handle) continue;
+        const ok = await selectOptionOnHandle(handle, visibleText);
+        if (ok) {
+          console.log(`Selected "${visibleText}" using selector ${sel}`);
+          return true;
+        } else {
+          // log options for this selector for debugging
+          const opts = await handle.$$eval('option', options => options.map(o => o.innerText.trim()));
+          console.log(`Selector ${sel} exists but options do not match (first 200 chars): ${opts.join(' | ').slice(0,200)}`);
+        }
+      } catch (e) {
+        console.warn(`Selector ${sel} caused error: ${e.message}`);
+      }
+    }
+    // if direct selectors failed, scan all selects (and print them)
+    const scanned = await debugAndSelectFromAllSelects(visibleText, labelForLogs || visibleText);
+    return scanned;
   }
 
   try {
@@ -84,20 +105,27 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
     await page.goto(targetURL, { waitUntil: 'networkidle', timeout: 60000 });
 
     // initial wait to let page JS populate selects
-    await sleep(3000);
+    await sleep(3500);
 
     // REGION & POU selectors (try a few possibilities)
-    const regionSelectors = ['#ddl_reg', 'select[name*="region"]', 'select:nth-of-type(1)'];
+    const regionSelectors = ['#ddl_reg', 'select[name*="reg"]', 'select[name*="region"]', 'select:nth-of-type(1)'];
     const pouSelectors = ['#ddl_pou', 'select[name*="pou"]', 'select:nth-of-type(2)'];
     const courseSelectors = ['#ddl_course', 'select[name*="course"]', 'select:nth-of-type(3)'];
 
-    // Select Region once
-    const gotRegion = await findAndSelect(regionSelectors, 'Southern');
-    if (gotRegion) await sleep(1500);
+    // Try selecting Region
+    const regionWanted = 'Southern';
+    const gotRegion = await findAndSelect(regionSelectors, regionWanted, 'Region');
+    if (gotRegion) {
+      await sleep(1600);
+    } else {
+      console.warn(`Failed to select "${regionWanted}". See select listings above for details.`);
+    }
 
-    // Select POU once
-    const gotPou = await findAndSelect(pouSelectors, 'HYDERABAD');
+    // Try selecting POU
+    const pouWanted = 'HYDERABAD';
+    const gotPou = await findAndSelect(pouSelectors, pouWanted, 'POU');
     if (gotPou) await sleep(1500);
+    else console.warn(`Failed to select POU "${pouWanted}".`);
 
     if (!gotRegion || !gotPou) {
       console.warn('Region or POU selection may have failed; script will continue but results may be incorrect.');
@@ -132,43 +160,26 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       console.log('Checking course:', courseName);
 
       // Select the course
-      const gotCourse = await findAndSelect(courseSelectors, courseName);
+      const gotCourse = await findAndSelect(courseSelectors, courseName, 'Course');
       if (!gotCourse) {
         console.warn(`Could not select course "${courseName}". Still attempting to click Get List and parse.`);
       }
+      await sleep(800);
 
       // Click Get List and wait a short while
       await clickGetList();
-      await sleep(2500);
+      await sleep(2200);
 
-      // locate table (similar logic as before)
-      const possibleTableSelectors = [
-        'table', 
-        '#ctl00_ContentPlaceHolder1_gvBatch',
-        'table[class*="grid"]',
-        'div.results table',
-        '#gvBatch'
-      ];
-      let tableHandle = null;
-      for (const sel of possibleTableSelectors) {
-        try {
-          tableHandle = await page.$(sel);
-          if (tableHandle) { console.log('Found table using selector:', sel); break; }
-        } catch (e){}
-      }
+      // locate table
+      let tableHandle = await page.$('table');
+      if (!tableHandle) tableHandle = await page.waitForSelector('table', { timeout: 6000 }).catch(()=>null);
       if (!tableHandle) {
-        // wait briefly for any table to appear
-        tableHandle = await page.waitForSelector('table', { timeout: 5000 }).catch(()=>null);
-        if (tableHandle) console.log('Found table by waiting for generic table selector.');
-      }
-
-      if (!tableHandle) {
-        // Dump short HTML snippet for debugging and continue to next course
         const html = await page.content();
-        const snippet = html.slice(0, 20000);
-        console.error(`No table found for course "${courseName}". Page HTML snippet (first 20k chars):`);
-        console.error(snippet);
+        console.error(`No table found for course "${courseName}". HTML snippet (first 20k chars):`);
+        console.error(html.slice(0,20000));
         continue;
+      } else {
+        console.log('Found table for course:', courseName);
       }
 
       // find available seats column index
@@ -182,7 +193,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         return idx;
       });
 
-      // parse rows for this course
       const seatInfo = await page.evaluate((colIndex) => {
         const tbl = document.querySelector('table');
         if (!tbl) return [];
@@ -203,7 +213,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         return results;
       }, colIndex);
 
-      // filter positive seats and attach course name
       const positiveForCourse = seatInfo
         .map(r => ({ course: courseName, batch: r.batch, seats: r.seats }))
         .filter(r => {
@@ -214,14 +223,12 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
       console.log(`Found ${positiveForCourse.length} positive rows for "${courseName}".`);
       aggregatedResults.push(...positiveForCourse);
 
-      // small delay before next course iteration
-      await sleep(1000);
+      await sleep(900);
     } // end courses loop
 
     await browser.close();
 
     if (aggregatedResults.length > 0) {
-      // build message grouped by course
       const grouped = aggregatedResults.reduce((acc, cur) => {
         acc[cur.course] = acc[cur.course] || [];
         acc[cur.course].push(`${cur.batch} → ${cur.seats}`);
@@ -254,7 +261,6 @@ function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
         console.warn('Telegram env vars missing; not sending Telegram message.');
       }
 
-      // Email notify via SMTP if provided
       if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS && EMAIL_TO) {
         try {
           const transporter = nodemailer.createTransport({
